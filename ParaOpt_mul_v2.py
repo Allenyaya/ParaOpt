@@ -3,24 +3,21 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
+import torch.multiprocessing as mp
 from tqdm import tqdm
+import argparse
 import time
 from datetime import timedelta
 import numpy as np
-import argparse
 import copy
 import os
-import torchvision.models as models
-import wandb
 
+# 配置类定义
 class Config:
-
-    device = 'cuda:0'
-
     # 训练参数
     batch_size = 64
     num_epochs = 1
-    max_steps = 10000  # 总迭代步数
+    max_steps = 60000  # 总迭代步数
     learning_rate = 0.001
     momentum = 0.9
     
@@ -35,30 +32,25 @@ class Config:
     
     # 系统配置
     seed = 42  # 随机种子
-
-    optimizer_type = 'SGD' # sgd,adam,adamw
-
-    # 训练模式
-    training_mode = 'parallel'
-    
-    # 模型配置
-    model_name = 'cnn'  # 默认使用自定义CNN
-    num_classes = 10    # 分类数量
-    pretrained = False  # 是否使用预训练模型
+    device_count = torch.cuda.device_count()  # GPU数量
 
     def update_from_args(self, args):
         for key, value in vars(args).items():
             if hasattr(self, key) and value is not None:
-                setattr(self, key, value)
+                setattr(self, key, value)    
 
+def to_device(batch, device):
+    images, labels = batch
+    return images.to(device), labels.to(device)
 
+# 定义卷积神经网络
 class CNN(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self):
         super(CNN, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.fc1 = nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = nn.Linear(128, num_classes)
+        self.fc2 = nn.Linear(128, 10)
         self.pool = nn.MaxPool2d(2, 2)
         self.relu = nn.ReLU()
 
@@ -82,7 +74,7 @@ class CNN(nn.Module):
         
     def get_params(self):
         return list(self.parameters())
-        
+
     def set_params(self, params, clone=True):
         my_params = self.get_params()
         for p, q in zip(my_params, params):
@@ -107,141 +99,66 @@ class CNN(nn.Module):
             for p, q in zip(my_params, other_params):
                 error += torch.linalg.norm(p-q).pow(2).item()
                 total_num += np.prod(list(q.shape))
-        return error / total_num * 1e6  # 缩放以便于比较
-
-
-class ModelWrapper(nn.Module):
-    """   
-    模型包装类，给任意模型提供与训练循环兼容的接口
-    """
-    def __init__(self, model):
-        super(ModelWrapper, self).__init__()
-        self.model = model
-        
-    def forward(self, x):
-        return self.model(x)
-        
-    def clone(self, device, other=None):
-        if other is None:
-            other = ModelWrapper(copy.deepcopy(self.model)).to(device)
-        else:
-            with torch.no_grad():
-                other_params = other.get_params()
-                my_params = self.get_params()
-                for param_to, param_from in zip(other_params, my_params):
-                    param_to.data = param_from.data.clone()
-        return other
-        
-    def get_params(self):
-        return list(self.parameters())
-        
-    def set_params(self, params, clone=True):
-        my_params = self.get_params()
-        for p, q in zip(my_params, params):
-            if clone:
-                p.data = q.data.clone().to(p.device)
-            else:
-                p.data = q.to(p.device)
-                
-    def set_grads_from_grads(self, grads):
-        my_params = self.get_params()
-        for p, grad in zip(my_params, grads):
-            if grad is not None:
-                p.grad = grad.to(p.device)
-                
-    def compute_error_from_model(self, other):
-        my_params = self.get_params()
-        other_params = other.get_params()
-        
-        with torch.no_grad():
-            error = 0.0
-            total_num = 0
-            for p, q in zip(my_params, other_params):
-                error += torch.linalg.norm(p-q).pow(2).item()
-                total_num += np.prod(list(q.shape))
-        return error / total_num * 1e6  # 缩放以便于比较
-
-
-class ModelFactory:
-    """
-    模型工厂类，根据配置创建和管理不同的神经网络模型
-    """
-    @staticmethod
-    def create_model(config):
-        model_name = config.model_name.lower()
-        num_classes = config.num_classes
-        pretrained = config.pretrained
-
-        # 自定义CNN模型
-        if model_name == 'cnn':
-            return CNN(num_classes=num_classes)
-            
-        # ResNet系列
-        elif model_name == 'resnet18':
-            model = models.resnet18(pretrained=pretrained)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-            return ModelWrapper(model)
-        elif model_name == 'resnet34':
-            model = models.resnet34(pretrained=pretrained)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-            return ModelWrapper(model)
-        elif model_name == 'resnet50':
-            model = models.resnet50(pretrained=pretrained)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-            return ModelWrapper(model)
-            
-        # VGG系列
-        elif model_name == 'vgg16':
-            model = models.vgg16(pretrained=pretrained)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-            return ModelWrapper(model)
-        elif model_name == 'vgg19':
-            model = models.vgg19(pretrained=pretrained)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-            return ModelWrapper(model)
-            
-        # DenseNet系列
-        elif model_name == 'densenet121':
-            model = models.densenet121(pretrained=pretrained)
-            model.classifier = nn.Linear(model.classifier.in_features, num_classes)
-            return ModelWrapper(model)
-            
-        # MobileNet系列
-        elif model_name == 'mobilenet_v2':
-            model = models.mobilenet_v2(pretrained=pretrained)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-            return ModelWrapper(model)
-            
-        # EfficientNet系列
-        elif model_name == 'efficientnet_b0':
-            model = models.efficientnet_b0(pretrained=pretrained)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-            return ModelWrapper(model)
-            
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
-
+        return error / total_num * 1e6
 
 def optimizer_state_clone(optimizer_from, optimizer_to):
     optimizer_to.load_state_dict(optimizer_from.state_dict())
 
+def get_all_train_iters(data_loader,config):
+    dataiters = []
+    for _ in range(config.max_steps):
+        dataiters.append(iter(data_loader))
+    return dataiters
 
-def take_step(model, optimizer, criterion, dataloader, data_iter, step, seed_offset):
+def run(rank,total_ranks,queues,config,model,criterion,train_loader,test_loader):
+
+    device = torch.device(f"cuda:{rank}")
+    model = model.to(device)
+    dataiters = get_all_train_iters(train_loader,config)
+    print('Start process',rank)
+
+    if rank == 0:
+        train_loop(config, model, criterion,queues,test_loader,device)
+        for _ in range(total_ranks - 1):
+            queues[0].put(None)
+    else:
+        worker_optimizer = optim.SGD(model.parameters(), 
+                                    lr=config.learning_rate, 
+                                    momentum=config.momentum)
+        run_worker(model,worker_optimizer,criterion,dataiters,queues,device,config.seed)
+
+def run_worker(model, optimizer, criterion, dataiters, queues, device, seed_offset):
+    
+    while True:
+        ret = queues[0].get()
+        if ret is None:
+            return
+            
+        params, step = ret
+        model.set_params(params, clone=False)
+        
+        res = take_step(model, optimizer, criterion, dataiters, device, step, seed_offset)
+        # data_iter = res['data_iter']  # 更新数据迭代器
+        
+        # 收集计算的梯度
+        my_params = model.get_params()
+        grads = [param.grad for param in my_params]
+        
+        # 将梯度和指标发送回主进程
+        queues[1].put((grads, step, {'loss': res['loss'], 'accuracy': res['accuracy'], 
+                                    'batch_size': res['batch_size'], 'correct': res['correct']}))
+
+def take_step(model, optimizer, criterion, dataiters, device, step, seed_offset):
+    """执行单个训练步骤并返回梯度"""
     # 设置随机种子以确保可重现性
     np.random.seed(step + seed_offset)
     torch.manual_seed(step + seed_offset)
     torch.cuda.manual_seed(step + seed_offset)
     
     # 获取批次数据
-    try:
-        images, labels = next(data_iter)
-    except StopIteration:
-        data_iter = iter(dataloader)
-        images, labels = next(data_iter)
+    batch = next(dataiters[step])
     
-    # 将数据移至GPU
-    device = next(model.parameters()).device
-    images, labels = images.to(device), labels.to(device)
+    images, labels = to_device(batch, device)
     
     # 前向和后向传播
     optimizer.zero_grad()
@@ -249,39 +166,30 @@ def take_step(model, optimizer, criterion, dataloader, data_iter, step, seed_off
     loss = criterion(outputs, labels)
     loss.backward()
     
-    # 保存梯度
-    grads = [param.grad.clone() for param in model.parameters()]
-    
     # 计算准确率
     _, predicted = torch.max(outputs.data, 1)
     correct = (predicted == labels).sum().item()
     accuracy = 100 * correct / labels.size(0)
     
     return {
-        'grads': grads,
         'loss': loss.item(),
         'accuracy': accuracy,
-        'data_iter': data_iter,
+        # 'data_iter': dataiters[step],
         'batch_size': labels.size(0),
         'correct': correct
     }
 
+def train_loop(config, model, criterion, queues, test_loader, device):
 
-def train_loop_parallel_simulation(config, model, criterion, train_loader, test_loader):
-    #在单GPU上使用串行模拟并行处理的训练循环
-
-    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    
     T = config.max_steps
-    P = min(config.P, T//2)
+    P = min(config.P, config.device_count)  # 调整窗口大小不超过GPU数量
     thresh = config.threshold
     
-    
+    # 初始化模型和优化器数组
     models = [None for _ in range(T+1)]
     optimizers = [None for _ in range(T+1)]
     
-
+    # 设置初始窗口
     begin_idx, end_idx = 0, P
     total_iters = 0
     
@@ -298,55 +206,36 @@ def train_loop_parallel_simulation(config, model, criterion, train_loader, test_
     # 克隆初始模型到窗口中的每个位置
     for step in range(P+1):
         models[step] = model.clone(device)
-        if config.optimizer_type.lower()=='sgd':
-            optimizers[step] = optim.SGD(models[step].parameters(), 
-                                        lr=config.learning_rate, 
-                                        momentum=config.momentum)
-        elif config.optimizer_type.lower()=='adam':
-            optimizers[step] = optim.Adam(models[step].parameters(),
-                                        lr=config.learning_rate,
-                                        betas=(0.9,0.999),
-                                        eps=1e-08)
-        elif config.optimizer_type.lower()=='adamw':
-            optimizers[step] = optim.AdamW(models[step].parameters(),
-                                         lr=config.learning_rate,
-                                         betas=(0.9,0.999),
-                                         eps=1e-08)
+        optimizers[step] = optim.SGD(models[step].parameters(), 
+                                     lr=config.learning_rate, 
+                                     momentum=config.momentum)
+    
 
-    # 主训练循环
-    data_iter = iter(train_loader)
     while begin_idx < T:
         # 计算窗口大小
         parallel_len = end_idx - begin_idx
         
-        # 存储梯度预测和指标
+        # 存储梯度预测
         pred_f = [None for _ in range(parallel_len)]
         metrics = [None for _ in range(parallel_len)]
         
-        # 串行模拟并行计算梯度
+        # 分发任务到工作进程
         for i in range(parallel_len):
             step = begin_idx + i
-            
-            # 串行计算每个模型的梯度
-            result = take_step(models[step], optimizers[step], criterion, 
-                              train_loader, data_iter, step, config.seed)
-            
-            # 更新数据迭代器
-            data_iter = result['data_iter']
-            
-            # 存储梯度和指标
-            pred_f[i] = result['grads']
-            metrics[i] = {
-                'loss': result['loss'],
-                'accuracy': result['accuracy'],
-                'batch_size': result['batch_size'],
-                'correct': result['correct']
-            }
+            params = [p.data for p in models[step].get_params()]
+            queues[0].put((params, step))
+        
+        # 收集工作进程的梯度
+        for i in range(parallel_len):
+            _grads, _step, _metrics = queues[1].get()
+            _i = _step - begin_idx
+            pred_f[_i] = _grads
+            metrics[_i] = _metrics
             
             # 更新统计数据
-            running_loss += result['loss']
-            running_correct += result['correct']
-            running_total += result['batch_size']
+            running_loss += _metrics['loss']
+            running_correct += _metrics['correct']
+            running_total += _metrics['batch_size']
         
         # 从窗口起点开始执行定点迭代
         rollout_model = models[begin_idx]
@@ -414,26 +303,22 @@ def train_loop_parallel_simulation(config, model, criterion, train_loader, test_
             pbar.set_description(
                 f'Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | Time: {elapsed_str}'
             )
-            wandb.log({"Train_Acc":accuracy,"Train_Loss":avg_loss,"Iter":total_iters,"Steps":begin_idx})
         
-        test_accuracy = evaluate_model(models[begin_idx], criterion, test_loader, device)
-        wandb.log({"Test_Acc":test_accuracy,"Iter":total_iters,"Steps":begin_idx})
-
         # 定期验证
-        elapsed = time.time() - start_time
-        if elapsed >= last_vis_time + config.val_check_interval and config.visualize_progress:
-            # 评估当前模型
-            # test_accuracy = evaluate_model(models[begin_idx], criterion, test_loader, device)
+        # elapsed = time.time() - start_time
+        # if elapsed >= last_vis_time + config.val_check_interval and config.visualize_progress:
+        #     # 评估当前模型
+        #     test_accuracy = evaluate_model(models[begin_idx], criterion, test_loader, device)
             
-            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-            print(f"\nStep {begin_idx}/{T} | Test Acc: {test_accuracy:.2f}% | Time: {elapsed_str}")
+        #     elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+        #     print(f"\nStep {begin_idx}/{T} | Test Acc: {test_accuracy:.2f}% | Time: {elapsed_str}")
             
-            # wandb.log({"Test_Acc":test_accuracy,"Step":begin_idx})
-            # wandb.log({"Test_Acc":test_accuracy,"Iter":total_iters,"Steps":begin_idx})
-            last_vis_time = elapsed
+        #     last_vis_time = elapsed
     
     # 训练结束
     pbar.close()
+    
+
     
     # 最终测试
     final_model = models[T]
@@ -448,38 +333,11 @@ def train_loop_parallel_simulation(config, model, criterion, train_loader, test_
     
     return final_model
 
-
-def evaluate_model(model, criterion, test_loader, device):
-    # 评估模型性能
-    model.eval()
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    
-    accuracy = 100 * correct / total
-    model.train()
-    return accuracy
-
-
 def train_loop_serial(config, model, criterion, train_loader, test_loader):
-    """标准的串行训练循环"""
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    total_iters = 0
-    
-    if config.optimizer_type.lower() == 'sgd':
-        optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
-    elif config.optimizer_type.lower() == 'adam':
-        optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, betas=(0.9, 0.999), eps=1e-08)
-    elif config.optimizer_type.lower() == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, betas=(0.9, 0.999), eps=1e-08)
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
     
     # 训练循环
     start_time = time.time()
@@ -510,20 +368,13 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader):
         # 计算准确率
         _, predicted = torch.max(outputs.data, 1)
         correct = (predicted == labels).sum().item()
+        accuracy = 100 * correct / labels.size(0)
         
         # 更新统计数据
         running_loss += loss.item()
         running_correct += correct
         running_total += labels.size(0)
         
-        # train_acc = 100 * running_correct / running_total
-        # avg_loss =  running_loss / (step + 1)
-        # test_acc = evaluate_model(model, criterion, test_loader, device)
-        
-        # total_iters += 1
-        
-        # wandb.log({"Train_Acc":train_acc,"Train_Loss":avg_loss,"Test_Acc":test_acc,"Iter":total_iters})
-
         # 更新进度条
         if (step + 1) % 5 == 0:
             avg_loss = running_loss / (step + 1)
@@ -549,9 +400,26 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader):
     
     return model
 
+def evaluate_model(model, criterion, test_loader, device):
+    """评估模型性能"""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    model.train()
+    return accuracy
 
 def setup_arg_parser():
-    parser = argparse.ArgumentParser(description='ParaSGD_simul')
+    parser = argparse.ArgumentParser(description='ParaOpt_mul_v1')
 
     parser.add_argument('--device',type=str,help='Choose CUDA device')
 
@@ -578,53 +446,57 @@ def setup_arg_parser():
     
     return parser
 
-
 def main():
+
     parser = setup_arg_parser()
     args = parser.parse_args()
 
     config = Config()
     config.update_from_args(args)
-
+    
+    # 设置随机种子
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    torch.cuda.manual_seed(config.seed)
-
-    # wandb = None
-    wandb.init(
-        project = 'NIPS_2025_ParaOptimizer',
-        name = "opt:" + str(config.optimizer_type) + "," + "train_mode:" + str(config.training_mode) + "," + "model:" + str(config.model_name) + "," + "max_steps:" + str(config.max_steps) + "," + "bs:" + str(config.batch_size) + "," + "ema_decay:" + str(config.ema_decay) + "," + "lr:" + str(config.learning_rate) + "," + "window_size:" + str(config.P) + "," + "adapt_type:" + str(config.adaptivity_type),
-        config = args
-    )
-    # 数据预处理和加载  
+    
+    # 数据预处理和加载
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     
     train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=config.batch_size, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,batch_size=config.batch_size, shuffle=True)
     
     test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=config.batch_size, shuffle=False)
     
-    # 使用模型工厂创建模型
-    model = ModelFactory.create_model(config)
+    # 创建模型和损失函数
+    model = CNN()
     criterion = nn.CrossEntropyLoss()
     
-    print(f"Using model: {config.model_name}")
-    
-    if config.training_mode.lower() == 'parallel':
-        trained_model = train_loop_parallel_simulation(config, model, criterion, train_loader, test_loader)
-    else:
-        trained_model = train_loop_serial(config, model, criterion, train_loader, test_loader)
+    torch.autograd.set_detect_anomaly(True)
+    mp.set_start_method('spawn',force=True)
+    queues = mp.Queue(),mp.Queue(),mp.Queue()
+
+    processes = []
+    num_processes = config.P + 1
+
+
+    if num_processes == 1:
+        run(0,1,queues,config,model,criterion,train_loader,test_loader)
+        exit(0)
+
+    for rank in range(num_processes):
+        p = mp.Process(target=run,args=(rank,num_processes,queues,config,model,criterion,train_loader,test_loader))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
     
     # 保存最终模型
-    model_save_path = f'{config.model_name}_model.pth'
-    torch.save(trained_model.state_dict(), model_save_path)
-    print(f"Model saved to '{model_save_path}'")
-
-    wandb.finish()
+    # torch.save(trained_model.state_dict(), 'cnn_model.pth')
+    # print("Model saved to 'cnn_model.pth'")
 
 if __name__ == "__main__":
     main()
