@@ -17,8 +17,8 @@
 
 实际并行：python ParaOpt_mul_v1.py --P 7 
 
-         --P 选择窗口大小 (P+1即GPU数量) 即选择GPU数量
+         P 选择窗口大小 (P+1即GPU数量) 即选择GPU数量
 
          python ParaOpt_mul_v2.py --P 7
-         
-         --P 选择窗口大小 (P+1即GPU数量)
+
+         P 选择窗口大小 (P+1即GPU数量)
