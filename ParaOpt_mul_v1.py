@@ -180,7 +180,7 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader):
     processes = []
     worker_devices = []
     
-    for rank in range(1, config.P + 1):
+    for rank in range(1, config.device_count):
         worker_device = torch.device(f"cuda:{rank}")
         worker_devices.append(worker_device)
         worker_model = CNN().to(worker_device)
@@ -201,7 +201,7 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader):
     model = model.to(device)
     
     T = config.max_steps
-    P = min(config.P, config.device_count)  # 调整窗口大小不超过GPU数量
+    P = min(config.P, config.max_steps)  # 调整窗口大小不超过GPU数量
     thresh = config.threshold
     
     # 初始化模型和优化器数组

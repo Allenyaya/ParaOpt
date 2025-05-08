@@ -11,16 +11,17 @@ import argparse
 import copy
 import os
 import torchvision.models as models
+
 import wandb
 
 class Config:
 
-    device = 2
+    device = 0
 
     # 训练参数
-    batch_size = 32
+    batch_size = 64
     num_epochs = 1
-    max_steps = 10000  # 总迭代步数
+    max_steps = 60000  # 总迭代步数
     learning_rate = 0.001
     momentum = 0.9
     
@@ -28,7 +29,7 @@ class Config:
     P = 7  # 窗口大小
     threshold = 1e-5  # 误差阈值
     ema_decay = 0.9  # 阈值指数移动平均衰减率
-    adaptivity_type = 'mean'  # 自适应策略: 'mean' 或 'median'
+    adaptivity_type = 'median'  # 自适应策略: 'mean' 或 'median'
     val_check_interval = 5  # 验证间隔(秒)
     visualize_progress = True  # 是否可视化进度
     display_time = True  # 是否显示运行时间
@@ -158,11 +159,14 @@ def train_with_config(config_dict=None):
         trained_model = train_loop_serial(config, model, criterion, train_loader, test_loader)
     
     # 评估最终测试准确率
-    final_accuracy = evaluate_model(trained_model, criterion, test_loader, 
+    final_accuracy,final_metrics = evaluate_model(trained_model, criterion, test_loader, 
                                    torch.device(config.device if torch.cuda.is_available() else "cpu"))
     
     # 记录最终指标
-    wandb.log({"final_test_accuracy": final_accuracy})
+    wandb.log({"final_test_accuracy": final_accuracy,
+               "final_test_precision":final_metrics["precision_macro"],
+               "final_test_recall":final_metrics["recall_macro"],
+               "final_test_f1-score":final_metrics["f1_macro"]})
     
     # 可选：保存最终模型
     model_save_path = f'{config.model_name}_model.pth'
@@ -526,30 +530,26 @@ def train_loop_parallel_simulation(config, model, criterion, train_loader, test_
             pbar.set_description(
                 f'Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | Time: {elapsed_str}'
             )
-            wandb.log({"Train_Acc":accuracy,"Train_Loss":avg_loss,"Iter":total_iters,"Steps":begin_idx})
+            wandb.log({"Train_Acc":accuracy,"Train_Loss":avg_loss,"Iter":total_iters,"Original_Steps":begin_idx})
         
-        test_accuracy = evaluate_model(models[begin_idx], criterion, test_loader, device)
-        wandb.log({"Test_Acc":test_accuracy,"Iter":total_iters,"Steps":begin_idx})
+        # test_accuracy,_ = evaluate_model(models[begin_idx], criterion, test_loader, device)
+        # wandb.log({"Test_Acc":test_accuracy,"Iter":total_iters,"Steps":begin_idx})
 
         # 定期验证
-        elapsed = time.time() - start_time
-        if elapsed >= last_vis_time + config.val_check_interval and config.visualize_progress:
-            # 评估当前模型
-            # test_accuracy = evaluate_model(models[begin_idx], criterion, test_loader, device)
+        # elapsed = time.time() - start_time
+        # if elapsed >= last_vis_time + config.val_check_interval and config.visualize_progress:
             
-            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-            print(f"\nStep {begin_idx}/{T} | Test Acc: {test_accuracy:.2f}% | Time: {elapsed_str}")
+        #     elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+        #     print(f"\nStep {begin_idx}/{T} | Test Acc: {test_accuracy:.2f}% | Time: {elapsed_str}")
             
-            # wandb.log({"Test_Acc":test_accuracy,"Step":begin_idx})
-            # wandb.log({"Test_Acc":test_accuracy,"Iter":total_iters,"Steps":begin_idx})
-            last_vis_time = elapsed
+        #     last_vis_time = elapsed
     
     # 训练结束
     pbar.close()
     
     # 最终测试
     final_model = models[T]
-    final_accuracy = evaluate_model(final_model, criterion, test_loader, device)
+    final_accuracy,_ = evaluate_model(final_model, criterion, test_loader, device)
     
     elapsed = time.time() - start_time
     elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
@@ -567,6 +567,8 @@ def evaluate_model(model, criterion, test_loader, device):
     correct = 0
     total = 0
     
+    all_preds = []
+    all_labels = []
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
@@ -574,10 +576,26 @@ def evaluate_model(model, criterion, test_loader, device):
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-    
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+                
     accuracy = 100 * correct / total
+
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    
+    precision_macro = precision_score(all_labels, all_preds, average='macro',zero_division=0)
+    recall_macro = recall_score(all_labels, all_preds, average='macro',zero_division=0)
+    f1_macro = f1_score(all_labels, all_preds, average='macro',zero_division=0)
+
+    metrics = {
+        'accuracy':accuracy,
+        'precision_macro':precision_macro * 100,
+        'recall_macro':recall_macro * 100,
+        'f1_macro':f1_macro * 100
+    }
     model.train()
-    return accuracy
+    return accuracy,metrics
 
 
 def train_loop_serial(config, model, criterion, train_loader, test_loader):
@@ -630,7 +648,7 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader):
         
         train_acc = 100 * running_correct / running_total
         avg_loss =  running_loss / (step + 1)
-        test_acc = evaluate_model(model, criterion, test_loader, device)
+        test_acc,_ = evaluate_model(model, criterion, test_loader, device)
         
         total_iters += 1
         
@@ -652,7 +670,7 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader):
     pbar.close()
     
     # 最终测试
-    test_accuracy = evaluate_model(model, criterion, test_loader, device)
+    test_accuracy,_ = evaluate_model(model, criterion, test_loader, device)
     
     elapsed = time.time() - start_time
     elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
@@ -699,7 +717,8 @@ def main():
     
     if args.sweep:
         # 创建新的sweep
-        sweep_config = setup_sweep_configuration()
+        # sweep_config = setup_sweep_configuration()
+        from config.sweep_config_2 import sweep_config
         sweep_id = wandb.sweep(sweep_config, project='NIPS_2025_ParaOptimizer')
         print(f"Created sweep with ID: {sweep_id}")
         
